@@ -1,5 +1,3 @@
-
-
 from extract import extract_text
 from chunk import split_text
 from embeddings import create_embeddings

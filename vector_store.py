@@ -2,7 +2,6 @@
 import faiss
 import numpy as np
 
-
 def create_index(embeddings):
 
     embeddings = np.array(embeddings).astype("float32")
