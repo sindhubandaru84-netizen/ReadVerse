@@ -87,16 +87,25 @@ Simple Explanation:
     return response.choices[0].message.content
 
 
-def generate_mcqs(context):
+def generate_mcqs(context, num_questions=5, exclude_questions=None):
+
+    exclude_block = ""
+    if exclude_questions:
+        already_used = "\n".join(f"- {q}" for q in exclude_questions)
+        exclude_block = f"""
+These questions have already been used. Do NOT repeat them or create
+close variations of them:
+{already_used}
+"""
 
     prompt = f"""
 You are ReadVerse, an AI quiz generator.
 
-Create exactly 5 multiple-choice questions from the PDF content.
+Create exactly {num_questions} multiple-choice questions from the PDF content.
 
 PDF CONTENT:
 {context}
-
+{exclude_block}
 Rules:
 - Use ONLY information from the PDF.
 - Each question must have exactly 4 options.
