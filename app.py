@@ -1,11 +1,119 @@
 import streamlit as st
 import json
+import html
+import hashlib
 
 from extract import extract_text
 from chunk import split_text
 from embeddings import create_embeddings
 from vector_store import create_index, search_index
 from important import explain_topic, explain_pdf, generate_mcqs
+from books import search_books, search_books_by_mood, BookSearchError
+from reader import render_reader, cached_search_all, cached_search_free
+from library import load_library, add_book, remove_book
+
+
+# ---------------------------------------------------------
+# SHARED: BOOK RESULT GRID
+# ---------------------------------------------------------
+
+def render_book_grid(results, cols_per_row=4, action_label=None, on_action=None, key_prefix="grid"):
+    """
+    Render a responsive grid of book cards with a details expander each.
+
+    If action_label and on_action are given, an extra button is shown
+    inside each book's expander (used for "Save to Library" /
+    "Remove from Library"). on_action receives the book dict.
+    """
+    for row_start in range(0, len(results), cols_per_row):
+        row_books = results[row_start:row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
+
+        for col_offset, (col, book) in enumerate(zip(cols, row_books)):
+            with col:
+                title = html.escape(book["title"])
+                authors = html.escape(", ".join(book["authors"]))
+                rating = book.get("rating")
+                rating_html = f"⭐ {rating}" if rating else "&nbsp;"
+                thumb = book.get("thumbnail") or ""
+
+                if thumb:
+                    cover_html = (
+                        f'<img src="{html.escape(thumb)}" '
+                        'style="width:100%;height:170px;object-fit:cover;'
+                        'border-radius:8px;display:block;">'
+                    )
+                else:
+                    cover_html = (
+                        '<div style="width:100%;height:170px;border-radius:8px;'
+                        'background:#eef1fb;display:flex;align-items:center;'
+                        'justify-content:center;color:#a7b2d6;font-size:11px;">'
+                        'No cover</div>'
+                    )
+
+                st.html(f"""
+                <div style="
+                    background:white;
+                    border:1px solid #edf0f7;
+                    border-radius:14px;
+                    padding:10px;
+                    margin-bottom:10px;
+                ">
+                    {cover_html}
+                    <div style="
+                        font-size:12px;
+                        font-weight:700;
+                        color:#27365d;
+                        margin-top:8px;
+                        line-height:1.35;
+                        min-height:32px;
+                    ">{title}</div>
+                    <div style="
+                        font-size:10px;
+                        color:#8a96af;
+                        margin-top:2px;
+                    ">{authors}</div>
+                    <div style="
+                        font-size:10px;
+                        color:#e2a239;
+                        margin-top:4px;
+                    ">{rating_html}</div>
+                </div>
+                """)
+
+                if book.get("readable"):
+                    if st.button("📖 Read",
+                                 key=f"{key_prefix}_read_{book.get('id', '')}_{row_start + col_offset}",
+                                 use_container_width=True, type="primary"):
+                        st.session_state["reading_book"] = book
+                        st.rerun()
+                else:
+                    st.caption("No readable copy available")
+
+                with st.expander("Details"):
+                    description = book.get("description") or "No description available."
+                    if len(description) > 500:
+                        description = description[:500] + "..."
+                    st.write(description)
+
+                    if book.get("published_date"):
+                        st.caption(f"Published: {book['published_date']}")
+                    if book.get("page_count"):
+                        st.caption(f"Pages: {book['page_count']}")
+                    if book.get("categories"):
+                        st.caption("Genre: " + ", ".join(book["categories"]))
+                    if book.get("preview_link"):
+                        st.link_button(
+                            "Preview on Google Books",
+                            book["preview_link"],
+                            use_container_width=True
+                        )
+
+                    if action_label and on_action:
+                        button_key = f"{key_prefix}_{action_label}_{book.get('id', '')}_{row_start + col_offset}"
+                        if st.button(action_label, key=button_key, use_container_width=True):
+                            on_action(book)
+                            st.rerun()
 
 
 # ---------------------------------------------------------
@@ -14,7 +122,7 @@ from important import explain_topic, explain_pdf, generate_mcqs
 
 st.set_page_config(
     page_title="ReadVerse",
-    page_icon="📚",
+    page_icon="R",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -29,7 +137,7 @@ st.html("""
 
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-* {
+*{
     font-family: 'Inter', sans-serif;
 }
 
@@ -204,6 +312,45 @@ section[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child
 
 
 /* ---------------------------------------------------------
+   MAIN FORM CONTROLS
+--------------------------------------------------------- */
+
+[data-testid="stRadio"] label {
+    color: #26365f !important;
+}
+
+[data-testid="stRadio"] label p {
+    color: #26365f !important;
+    font-size: 14px !important;
+}
+
+[data-testid="stRadio"] [role="radiogroup"] label,
+[data-testid="stRadio"] [role="radiogroup"] label *,
+[data-testid="stRadio"] [role="radiogroup"] label div,
+[data-testid="stRadio"] [role="radiogroup"] label span {
+    color: #26365f !important;
+}
+
+[data-testid="stRadio"] [role="radiogroup"] label {
+    background: transparent !important;
+}
+
+[data-testid="stRadio"] [role="radiogroup"] {
+    gap: 10px !important;
+}
+
+div[data-testid="stTextInput"] input {
+    background: #ffffff !important;
+    color: #26365f !important;
+    -webkit-text-fill-color: #26365f !important;
+}
+
+div[data-testid="stTextInput"] input::placeholder {
+    color: #8a95ad !important;
+    opacity: 1 !important;
+}
+
+/* ---------------------------------------------------------
    HERO
 --------------------------------------------------------- */
 
@@ -325,23 +472,47 @@ div[data-testid="stTextInput"] {
 }
 
 div[data-testid="stTextInput"] > div {
-    background: white;
-    border: 1px solid #edf0f7;
+    background: #ffffff;
+    border: 1.5px solid #b8c4ea;
     border-radius: 28px;
-    box-shadow: 0 5px 18px rgba(67, 89, 145, 0.08);
-    height: 42px;
+    box-shadow: 0 4px 14px rgba(67, 89, 145, 0.14);
+    height: 46px;
+}
+
+div[data-testid="stTextInput"] > div:focus-within {
+    border-color: #4d7cff;
+    box-shadow: 0 0 0 3px rgba(77, 124, 255, 0.18);
 }
 
 div[data-testid="stTextInput"] input {
     border: none !important;
     box-shadow: none !important;
     background: transparent !important;
-    font-size: 11px !important;
-    color: #52617e !important;
+    font-size: 15px !important;
+    padding-left: 18px !important;
+    padding-right: 18px !important;
+    color: #26365f !important;
+    -webkit-text-fill-color: #26365f !important;
 }
 
 div[data-testid="stTextInput"] input::placeholder {
-    color: #a2abc0 !important;
+    color: #7d89a8 !important;
+    -webkit-text-fill-color: #7d89a8 !important;
+    opacity: 1 !important;
+}
+
+/* Inputs inside st.form (e.g. "Ask a Question") were losing their
+   white background/dark text in some browsers - force it here too. */
+div[data-testid="stForm"] div[data-testid="stTextInput"] > div {
+    background: #ffffff !important;
+    border: 1.5px solid #b8c4ea !important;
+    border-radius: 10px !important;
+}
+
+div[data-testid="stForm"] div[data-testid="stTextInput"] input {
+    background: #ffffff !important;
+    color: #26365f !important;
+    -webkit-text-fill-color: #26365f !important;
 }
 
 .search-button button {
@@ -632,47 +803,49 @@ with st.sidebar:
 
     st.html("""
     <div class="logo-area">
-
         <div class="logo-row">
-            <div class="logo-icon">📖</div>
-
+            <div class="logo-icon">
+                <span style="
+                    display:block;
+                    width:18px;
+                    height:20px;
+                    border:2px solid white;
+                    border-radius:2px 5px 5px 2px;
+                    position:relative;
+                    box-sizing:border-box;
+                "></span>
+            </div>
             <div>
                 <div class="logo-text">ReadVerse</div>
                 <div class="logo-subtitle">Read · Learn · Grow</div>
             </div>
         </div>
-
     </div>
     """)
 
     page = st.radio(
         "Navigation",
         [
-            "🏠  Home",
-            "📄  Upload & Read",
-            "🔍  Search Novels",
-            "😊  Mood Recommendations",
-            "🔖  My Library"
+            "Home",
+            "Upload & Read",
+            "Search Novels",
+            "Mood Recommendations",
+            "My Library"
         ],
         label_visibility="collapsed"
     )
 
     st.html("""
     <div class="sidebar-bottom">
-
         <div class="sidebar-star">✦</div>
-
         <div class="sidebar-bottom-title">
             Good books<br>
             better days
         </div>
-
         <div class="sidebar-bottom-text">
             Read. Learn. Grow.
         </div>
-
         <div class="sidebar-wave"></div>
-
     </div>
     """)
 
@@ -681,49 +854,33 @@ with st.sidebar:
 # HOME
 # ---------------------------------------------------------
 
-if page == "🏠  Home":
+if st.session_state.get("reading_book"):
+    render_reader(st.session_state["reading_book"])
 
-    # Hero
+elif page == "Home":
+
     st.html("""
     <div class="hero">
-
-        <div class="welcome">
-            WELCOME TO
-        </div>
-
-        <div class="hero-title">
-            Read<span>Verse</span>
-        </div>
-
+        <div class="welcome">WELCOME TO</div>
+        <div class="hero-title">Read<span>Verse</span></div>
         <div class="hero-text">
             Your space to explore books, understand ideas,<br>
             and find your next favorite read.
         </div>
-
         <div class="hero-note">
             More books.<br>
             More perspectives.
         </div>
-
         <div class="hero-books">
             <div class="book-stack book-one"></div>
             <div class="book-stack book-two"></div>
             <div class="book-stack book-three"></div>
         </div>
-
-        <div class="hero-cup">
-            ☕
-        </div>
-
-        <div class="hero-plant">
-            🌿
-        </div>
-
+        <div class="hero-cup"> </div>
+        <div class="hero-plant"> </div>
     </div>
     """)
 
-
-    # Search
     st.html("""
     <div class="search-area"></div>
     """)
@@ -739,141 +896,74 @@ if page == "🏠  Home":
 
     with col2:
         st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
-
-        search_clicked = st.button(
-            "Search",
-            use_container_width=True
-        )
+        search_clicked = st.button("Search", use_container_width=True)
 
     if search_clicked and search_text.strip():
         st.session_state["novel_search"] = search_text.strip()
-        st.session_state["go_to_search"] = True
-        st.rerun()
+        st.info("Open Search Novels from the sidebar to view the search.")
 
-
-    # Feature cards
     st.html("""
     <div style="height:2px"></div>
-
     <div style="
         display:grid;
         grid-template-columns:repeat(4,1fr);
         gap:14px;
     ">
-
         <div class="feature-card feature-purple">
-
-            <div class="feature-icon icon-purple">
-                📖
-            </div>
-
-            <div class="feature-title">
-                Upload & Read
-            </div>
-
+            <div class="feature-icon icon-purple">R</div>
+            <div class="feature-title">Upload & Read</div>
             <div class="feature-text">
                 Upload your PDF and get
                 instant summaries, explanations
                 and key insights.
             </div>
-
-            <div class="feature-arrow">
-                →
-            </div>
-
+            <div class="feature-arrow">→</div>
         </div>
 
-
         <div class="feature-card feature-green">
-
-            <div class="feature-icon icon-green">
-                🔍
-            </div>
-
-            <div class="feature-title">
-                Search Novels
-            </div>
-
+            <div class="feature-icon icon-green">S</div>
+            <div class="feature-title">Search Novels</div>
             <div class="feature-text">
                 Find your next favorite book
                 by searching titles, authors
                 or genres.
             </div>
-
-            <div class="feature-arrow">
-                →
-            </div>
-
+            <div class="feature-arrow">→</div>
         </div>
 
-
         <div class="feature-card feature-pink">
-
-            <div class="feature-icon icon-pink">
-                😊
-            </div>
-
-            <div class="feature-title">
-                Mood Recommendations
-            </div>
-
+            <div class="feature-icon icon-pink">M</div>
+            <div class="feature-title">Mood Recommendations</div>
             <div class="feature-text">
                 Tell us how you feel, and get
                 personalized book suggestions
                 just for you.
             </div>
-
-            <div class="feature-arrow">
-                →
-            </div>
-
+            <div class="feature-arrow">→</div>
         </div>
 
-
         <div class="feature-card feature-blue">
-
-            <div class="feature-icon icon-blue">
-                🔖
-            </div>
-
-            <div class="feature-title">
-                My Library
-            </div>
-
+            <div class="feature-icon icon-blue">L</div>
+            <div class="feature-title">My Library</div>
             <div class="feature-text">
                 Save your favorite books
                 and keep track of your
                 reading journey.
             </div>
-
-            <div class="feature-arrow">
-                →
-            </div>
-
+            <div class="feature-arrow">→</div>
         </div>
-
     </div>
     """)
 
-
-    # Popular books heading
     st.html("""
     <div class="section-heading">
-
         <div class="section-title">
-            <span>✦</span>
-            Popular Books
+            <span>✦</span> Popular Books
         </div>
-
-        <div class="view-all">
-            View all →
-        </div>
-
+        <div class="view-all">View all →</div>
     </div>
     """)
 
-
-    # Books
     books = [
         ("Atomic Habits", "James Clear", "Self Help", "cover-atomic"),
         ("The Midnight Library", "Matt Haig", "Fiction", "cover-midnight"),
@@ -884,32 +974,15 @@ if page == "🏠  Home":
     ]
 
     cols = st.columns(6, gap="small")
-
     for col, book in zip(cols, books):
-
         title, author, tag, cover = book
-
         with col:
-
             st.html(f"""
             <div class="book-card">
-
-                <div class="book-cover {cover}">
-                    {title}
-                </div>
-
-                <div class="book-title">
-                    {title}
-                </div>
-
-                <div class="book-author">
-                    {author}
-                </div>
-
-                <div class="book-tag">
-                    {tag}
-                </div>
-
+                <div class="book-cover {cover}">{html.escape(title)}</div>
+                <div class="book-title">{html.escape(title)}</div>
+                <div class="book-author">{html.escape(author)}</div>
+                <div class="book-tag">{html.escape(tag)}</div>
             </div>
             """)
 
@@ -918,13 +991,10 @@ if page == "🏠  Home":
 # UPLOAD & READ
 # ---------------------------------------------------------
 
-elif page == "📄  Upload & Read":
+elif page == "Upload & Read":
 
     st.html("""
-    <div class="page-title">
-        Upload & Read
-    </div>
-
+    <div class="page-title">Upload & Read</div>
     <div class="page-subtitle">
         Upload a PDF and explore its content with ReadVerse.
     </div>
@@ -937,250 +1007,401 @@ elif page == "📄  Upload & Read":
 
     if uploaded_file is not None:
 
-        with open("uploaded.pdf", "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
 
-        st.success("PDF uploaded successfully!")
+        if st.session_state.get("pdf_hash") != file_hash:
+            with open("uploaded.pdf", "wb") as f:
+                f.write(file_bytes)
 
-        text = extract_text("uploaded.pdf")
+            with st.spinner("Preparing your PDF..."):
+                text = extract_text("uploaded.pdf")
+                chunks = split_text(text) if text else []
+                embeddings = create_embeddings(chunks) if chunks else []
+                index = create_index(embeddings) if chunks else None
 
-        if text:
-
-            chunks = split_text(text)
-            embeddings = create_embeddings(chunks)
-            index = create_index(embeddings)
-
+            st.session_state["pdf_hash"] = file_hash
+            st.session_state["pdf_text"] = text
             st.session_state["chunks"] = chunks
             st.session_state["index"] = index
+            st.session_state["quiz"] = None
+            st.session_state["submitted"] = False
+            st.session_state["score"] = 0
 
-            st.html("""
-            <div class="content-box">
-            """)
-            
+        text = st.session_state.get("pdf_text", "")
+        chunks = st.session_state.get("chunks", [])
+        index = st.session_state.get("index")
+
+        if text:
             option = st.radio(
                 "Choose an option",
                 [
-                    "🧠 Explain PDF",
-                    "❓ Ask a Question",
-                    "📝 Generate MCQs"
-                ]
+                    "Explain PDF",
+                    "Ask a Question",
+                    "Generate MCQs"
+                ],
+                horizontal=True
             )
 
-            st.html("""
-            </div>
-            """)
-
-            # -------------------------------------------------
-            # EXPLAIN PDF
-            # -------------------------------------------------
-
-            if option == "🧠 Explain PDF":
+            if option == "Explain PDF":
 
                 if st.button("Explain PDF"):
-
                     with st.spinner("Reading and explaining your PDF..."):
-
                         explanation = explain_pdf(text)
 
-                    st.subheader("📖 Explanation")
-                    st.write(explanation)
+                    safe_explanation = html.escape(str(explanation))
+                    safe_explanation = safe_explanation.replace("\n\n", "<br><br>")
+                    safe_explanation = safe_explanation.replace("\n", "<br>")
 
+                    st.html(f"""
+                    <div style="
+                        background:#ffffff;
+                        padding:28px;
+                        margin-top:20px;
+                        border-radius:16px;
+                        border:1px solid #dfe5f2;
+                        box-shadow:0 6px 20px rgba(50,70,120,0.08);
+                    ">
+                        <div style="
+                            color:#172b67;
+                            font-size:20px;
+                            font-weight:700;
+                            margin-bottom:18px;
+                        ">Explanation</div>
+                        <div style="
+                            color:#26365f !important;
+                            font-size:14px;
+                            line-height:1.8;
+                            font-weight:400;
+                        ">{safe_explanation}</div>
+                    </div>
+                    """)
 
-            # -------------------------------------------------
-            # ASK QUESTION
-            # -------------------------------------------------
+            elif option == "Ask a Question":
 
-            elif option == "❓ Ask a Question":
-
-                question = st.text_input(
-                    "Enter your question",
-                    placeholder="Ask something about the PDF..."
-                )
-
-                if st.button("Ask Question") and question:
-
-                    query_embedding = create_embeddings([question])
-
-                    results = search_index(
-                        index,
-                        query_embedding,
-                        chunks
+                with st.form("ask_question_form", clear_on_submit=False):
+                    question = st.text_input(
+                        "Question",
+                        placeholder="Ask something about the PDF...",
+                        label_visibility="collapsed"
                     )
+                    ask_submitted = st.form_submit_button("Ask Question")
 
-                    context = "\n".join(results)
+                if ask_submitted and question.strip():
+                    with st.spinner("Finding the answer..."):
+                        query_embedding = create_embeddings([question.strip()])
+                        search_results = search_index(index, query_embedding, 3)
 
-                    answer = explain_topic(
-                        context,
-                        question
-                    )
+                        if isinstance(search_results, tuple) and len(search_results) == 2:
+                            _, indices = search_results
+                            if hasattr(indices, "tolist"):
+                                indices = indices.tolist()
+                            if indices and isinstance(indices[0], (list, tuple)):
+                                indices = indices[0]
+                            relevant_chunks = [
+                                chunks[int(i)]
+                                for i in indices
+                                if 0 <= int(i) < len(chunks)
+                            ]
+                        else:
+                            results = search_results
+                            if hasattr(results, "tolist"):
+                                results = results.tolist()
+                            if isinstance(results, (list, tuple)) and results and isinstance(results[0], (list, tuple)):
+                                results = results[0]
+                            if isinstance(results, (list, tuple)) and all(
+                                isinstance(x, (int, float)) and float(x).is_integer() for x in results
+                            ):
+                                relevant_chunks = [
+                                    chunks[int(i)]
+                                    for i in results
+                                    if 0 <= int(i) < len(chunks)
+                                ]
+                            else:
+                                relevant_chunks = list(results) if isinstance(results, (list, tuple)) else [str(results)]
 
-                    st.subheader("💡 Answer")
-                    st.write(answer)
+                        context = "\n\n".join(str(chunk) for chunk in relevant_chunks)
+                        answer = explain_topic(question.strip(), context)
 
+                    safe_answer = html.escape(str(answer))
+                    safe_answer = safe_answer.replace("\n\n", "<br><br>")
+                    safe_answer = safe_answer.replace("\n", "<br>")
 
-            # -------------------------------------------------
-            # GENERATE MCQS
-            # -------------------------------------------------
+                    st.html(f"""
+                    <div style="
+                        background:#ffffff;
+                        padding:28px;
+                        margin-top:20px;
+                        border-radius:16px;
+                        border:1px solid #dfe5f2;
+                        box-shadow:0 6px 20px rgba(50,70,120,0.08);
+                    ">
+                        <div style="
+                            color:#172b67;
+                            font-size:20px;
+                            font-weight:700;
+                            margin-bottom:18px;
+                        ">Answer</div>
+                        <div style="
+                            color:#26365f;
+                            font-size:14px;
+                            line-height:1.8;
+                        ">{safe_answer}</div>
+                    </div>
+                    """)
 
-            elif option == "📝 Generate MCQs":
+            elif option == "Generate MCQs":
 
                 if "quiz" not in st.session_state:
                     st.session_state.quiz = None
-
                 if "submitted" not in st.session_state:
                     st.session_state.submitted = False
-
                 if "score" not in st.session_state:
                     st.session_state.score = 0
 
-                if st.button("Generate MCQs"):
+                def _parse_quiz_response(quiz_data):
+                    # Handle normal JSON, JSON inside ```json fences,
+                    # and responses containing extra text around the JSON array.
+                    if isinstance(quiz_data, str):
+                        raw = quiz_data.strip()
+                        if raw.startswith("```json"):
+                            raw = raw[7:]
+                        elif raw.startswith("```"):
+                            raw = raw[3:]
+                        if raw.endswith("```"):
+                            raw = raw[:-3]
+                        raw = raw.strip()
 
+                        start = raw.find("[")
+                        end = raw.rfind("]")
+                        if start != -1 and end != -1 and end > start:
+                            raw = raw[start:end + 1]
+
+                        quiz_data = json.loads(raw)
+
+                    if isinstance(quiz_data, dict):
+                        quiz_data = quiz_data.get("questions", quiz_data.get("quiz", []))
+
+                    if not isinstance(quiz_data, list) or not quiz_data:
+                        raise ValueError("No quiz questions were returned")
+
+                    # Validate the fields needed by the UI.
+                    for q in quiz_data:
+                        if not isinstance(q, dict):
+                            raise ValueError("Invalid question format")
+                        if "question" not in q or "options" not in q or "answer" not in q:
+                            raise ValueError("Each question needs question, options, and answer fields")
+                        if not isinstance(q["options"], list) or len(q["options"]) < 2:
+                            raise ValueError("Each question must have at least two options")
+
+                    return quiz_data
+
+                num_questions = st.number_input(
+                    "Number of questions",
+                    min_value=1,
+                    max_value=25,
+                    value=5,
+                    step=1
+                )
+
+                gen_col1, gen_col2 = st.columns(2)
+                with gen_col1:
+                    generate_clicked = st.button("Generate MCQs", use_container_width=True)
+                with gen_col2:
+                    add_more_clicked = st.button(
+                        "Add More Questions",
+                        use_container_width=True,
+                        disabled=not st.session_state.quiz
+                    )
+
+                if generate_clicked:
                     with st.spinner("Generating questions..."):
-
-                        quiz_data = generate_mcqs(text)
+                        quiz_data = generate_mcqs(text, num_questions=int(num_questions))
 
                     try:
-                        if isinstance(quiz_data, str):
-                            quiz_data = json.loads(quiz_data)
-
-                        st.session_state.quiz = quiz_data
+                        st.session_state.quiz = _parse_quiz_response(quiz_data)
                         st.session_state.submitted = False
                         st.session_state.score = 0
 
-                    except Exception:
+                    except Exception as e:
+                        st.session_state.quiz = None
+                        st.error(f"Could not read the generated quiz: {e}")
 
-                        st.error(
-                            "Could not read the generated quiz. "
-                            "Please try again."
+                if add_more_clicked and st.session_state.quiz:
+                    with st.spinner("Generating more questions..."):
+                        existing_questions = [q["question"] for q in st.session_state.quiz]
+                        quiz_data = generate_mcqs(
+                            text,
+                            num_questions=int(num_questions),
+                            exclude_questions=existing_questions
                         )
+
+                    try:
+                        new_questions = _parse_quiz_response(quiz_data)
+                        st.session_state.quiz = st.session_state.quiz + new_questions
+                        st.session_state.submitted = False
+
+                    except Exception as e:
+                        st.error(f"Could not generate more questions: {e}")
 
                 if st.session_state.quiz:
-
                     quiz = st.session_state.quiz
 
-                    st.subheader("📝 Quiz")
+                    st.html("""
+                    <div style="
+                        background:#ffffff;
+                        padding:22px;
+                        margin-top:20px;
+                        margin-bottom:20px;
+                        border-radius:16px;
+                        border:1px solid #dfe5f2;
+                    ">
+                        <div style="
+                            color:#172b67;
+                            font-size:20px;
+                            font-weight:700;
+                        ">Quiz</div>
+                    </div>
+                    """)
 
                     for i, q in enumerate(quiz):
-
-                        st.write(
-                            f"**{i + 1}. {q['question']}**"
-                        )
+                        question_text = html.escape(str(q["question"]))
+                        st.html(f"""
+                        <div style="
+                            color:#172b67;
+                            font-size:15px;
+                            line-height:1.6;
+                            font-weight:600;
+                            margin-top:18px;
+                            margin-bottom:8px;
+                        ">
+                            {i + 1}. {question_text}
+                        </div>
+                        """)
 
                         st.radio(
                             "Choose your answer",
                             q["options"],
-                            key=f"question_{i}"
+                            key=f"question_{i}",
+                            index=None,
+                            label_visibility="collapsed"
                         )
 
                     if st.button("Submit Quiz"):
-
                         score = 0
-
                         for i, q in enumerate(quiz):
+                            answer = st.session_state.get(f"question_{i}")
+                            correct_answer = q["answer"]
 
-                            answer = st.session_state.get(
-                                f"question_{i}"
-                            )
+                            if isinstance(correct_answer, int):
+                                if 0 <= correct_answer < len(q["options"]):
+                                    correct_answer = q["options"][correct_answer]
+                                elif 1 <= correct_answer <= len(q["options"]):
+                                    correct_answer = q["options"][correct_answer - 1]
 
-                            if answer == q["answer"]:
+                            if str(answer).strip().lower() == str(correct_answer).strip().lower():
                                 score += 1
 
                         st.session_state.score = score
                         st.session_state.submitted = True
 
-                        st.rerun()
-
                     if st.session_state.submitted:
-
-                        st.success(
-                            f"Your score: "
-                            f"{st.session_state.score}/{len(quiz)}"
-                        )
+                        st.html(f"""
+                        <div style="
+                            background:#eef7f1;
+                            color:#23613b;
+                            border:1px solid #cde8d7;
+                            border-radius:12px;
+                            padding:14px 18px;
+                            margin-top:18px;
+                            font-size:15px;
+                            font-weight:600;
+                        ">
+                            Score: {st.session_state.score}/{len(quiz)}
+                        </div>
+                        """)
+        else:
+            st.error("Could not extract text from this PDF.")
 
 
 # ---------------------------------------------------------
 # SEARCH NOVELS
 # ---------------------------------------------------------
 
-elif page == "🔍  Search Novels":
+elif page == "Search Novels":
 
     st.html("""
-    <div class="page-title">
-        Search Novels
-    </div>
-
+    <div class="page-title">Search Novels</div>
     <div class="page-subtitle">
         Find books by title, author, genre, or topic.
     </div>
     """)
 
     col1, col2 = st.columns([5, 1])
-
     with col1:
-
         query = st.text_input(
             "Novel Search",
             value=st.session_state.get("novel_search", ""),
             placeholder="Search for a novel, author, or topic...",
             label_visibility="collapsed"
         )
-
     with col2:
+        search = st.button("Search", use_container_width=True)
 
-        search = st.button(
-            "Search",
-            use_container_width=True
-        )
+    if search and query.strip():
+        st.session_state["novel_search"] = query.strip()
 
-    if search and query:
+    active_query = st.session_state.get("novel_search", "")
 
-        st.session_state["novel_search"] = query
-
+    if active_query:
         st.html(f"""
-        <div class="content-box">
-
-            <div style="
-                font-size:14px;
-                font-weight:700;
-                color:#27365d;
-                margin-bottom:8px;
-            ">
-                Search results for "{query}"
-            </div>
-
-            <div style="
-                font-size:11px;
-                color:#8a96af;
-            ">
-                🔎 Google Books search will be connected here.
-            </div>
-
+        <div style="font-size:15px;font-weight:700;color:#27365d;margin-bottom:6px;">
+            Results for "{html.escape(active_query)}"
         </div>
         """)
 
-    else:
+        tab_free, tab_all = st.tabs(["📖 Read free (full books)", "🔎 All books (previews)"])
 
+        with tab_free:
+            st.caption("Public-domain classics from Project Gutenberg. Read them right here.")
+            try:
+                with st.spinner("Searching free books..."):
+                    free_results = cached_search_free(active_query)
+            except Exception as e:
+                free_results = []
+                st.error(f"Free book search failed: {e}")
+
+            if free_results:
+                render_book_grid(free_results, action_label="Save to Library",
+                                 on_action=add_book, key_prefix="free")
+            else:
+                st.info("No free full-text edition found. Modern books are usually "
+                        "copyrighted, so try the 'All books' tab for previews.")
+
+        with tab_all:
+            search_failed = False
+            try:
+                with st.spinner("Searching for books..."):
+                    all_results = cached_search_all(active_query)
+            except BookSearchError as e:
+                all_results = []
+                search_failed = True
+                st.error(f"Book search failed: {e}")
+
+            if all_results:
+                render_book_grid(all_results, action_label="Save to Library",
+                                 on_action=add_book, key_prefix="all")
+            elif not search_failed:
+                st.info("No results. Try a different title, author, or keyword.")
+    else:
         st.html("""
         <div class="content-box">
-
-            <div style="
-                font-size:14px;
-                font-weight:700;
-                color:#27365d;
-                margin-bottom:8px;
-            ">
-                🔎 Discover your next book
+            <div style="font-size:15px;font-weight:700;color:#27365d;margin-bottom:8px;">
+                Discover your next book
             </div>
-
-            <div style="
-                font-size:11px;
-                color:#8a96af;
-                line-height:18px;
-            ">
+            <div style="font-size:11px;color:#8a96af;line-height:18px;">
                 Search for novels, authors, genres and topics.
-                Google Books API integration can be added here.
             </div>
-
         </div>
         """)
 
@@ -1189,13 +1410,10 @@ elif page == "🔍  Search Novels":
 # MOOD RECOMMENDATIONS
 # ---------------------------------------------------------
 
-elif page == "😊  Mood Recommendations":
+elif page == "Mood Recommendations":
 
     st.html("""
-    <div class="page-title">
-        Mood Recommendations
-    </div>
-
+    <div class="page-title">Mood Recommendations</div>
     <div class="page-subtitle">
         Tell ReadVerse how you're feeling and discover books that match your mood.
     </div>
@@ -1203,7 +1421,6 @@ elif page == "😊  Mood Recommendations":
 
     st.html("""
     <div class="content-box">
-
         <div style="
             font-size:15px;
             font-weight:700;
@@ -1212,82 +1429,126 @@ elif page == "😊  Mood Recommendations":
         ">
             How are you feeling today?
         </div>
-
     </div>
     """)
 
     mood = st.selectbox(
         "Mood",
         [
-            "😊 Happy",
-            "😌 Calm",
-            "💪 Motivated",
-            "😔 Emotional",
-            "🧠 Curious",
-            "❤️ Romantic",
-            "🌱 Looking for personal growth"
+            "Happy",
+            "Calm",
+            "Motivated",
+            "Emotional",
+            "Curious",
+            "Romantic",
+            "Looking for personal growth"
         ],
         label_visibility="collapsed"
     )
 
-    if st.button("Find Books"):
+    find_clicked = st.button("Find Books")
 
-        st.success(
-            f"Finding books for your mood: {mood}"
+    if find_clicked:
+        st.session_state["mood_selected"] = mood
+
+    active_mood = st.session_state.get("mood_selected")
+
+    if active_mood:
+        needs_fetch = (
+            find_clicked
+            or st.session_state.get("mood_results_for") != active_mood
         )
 
-        st.info(
-            "AI-based mood recommendation will be connected here."
-        )
+        if needs_fetch:
+            with st.spinner(f"Finding books for your mood: {active_mood}..."):
+                st.session_state["mood_results"] = search_books_by_mood(active_mood, max_results=12)
+                st.session_state["mood_results_for"] = active_mood
+
+        results = st.session_state.get("mood_results", [])
+
+        if results:
+            mood_html = html.escape(active_mood)
+            st.html(f"""
+            <div style="
+                font-size:15px;
+                font-weight:700;
+                color:#27365d;
+                margin:18px 0 14px 0;
+            ">
+                Books for when you're feeling {mood_html}
+            </div>
+            """)
+
+            render_book_grid(results, action_label="Save to Library", on_action=add_book)
+        else:
+            st.html("""
+            <div class="content-box">
+                <div style="
+                    font-size:15px;
+                    font-weight:700;
+                    color:#27365d;
+                    margin-bottom:8px;
+                ">
+                    No matches found
+                </div>
+                <div style="font-size:11px;color:#8a96af;line-height:18px;">
+                    Try selecting a different mood.
+                </div>
+            </div>
+            """)
 
 
 # ---------------------------------------------------------
 # MY LIBRARY
 # ---------------------------------------------------------
 
-elif page == "🔖  My Library":
+elif page == "My Library":
 
     st.html("""
-    <div class="page-title">
-        My Library
-    </div>
-
+    <div class="page-title">My Library</div>
     <div class="page-subtitle">
         Keep your favorite books and reading journey in one place.
     </div>
-
-    <div class="content-box">
-
-        <div style="
-            text-align:center;
-            padding:35px 20px;
-        ">
-
-            <div style="
-                font-size:38px;
-                margin-bottom:10px;
-            ">
-                🔖
-            </div>
-
-            <div style="
-                font-size:15px;
-                font-weight:700;
-                color:#27365d;
-                margin-bottom:7px;
-            ">
-                Your library is empty
-            </div>
-
-            <div style="
-                font-size:11px;
-                color:#8b96ae;
-            ">
-                Save your favorite books here and
-                build your personal reading collection.
-            </div>
-
-        </div>
-
-    </div>
     """)
+
+    library_books = load_library()
+
+    if library_books:
+        render_book_grid(
+            library_books,
+            action_label="Remove from Library",
+            on_action=lambda book: remove_book(book.get("id"))
+        )
+    else:
+        st.html("""
+        <div class="content-box">
+            <div style="
+                text-align:center;
+                padding:35px 20px;
+            ">
+                <div style="
+                    font-size:28px;
+                    font-weight:700;
+                    color:#6478ff;
+                    margin-bottom:10px;
+                ">Library</div>
+
+                <div style="
+                    font-size:15px;
+                    font-weight:700;
+                    color:#27365d;
+                    margin-bottom:7px;
+                ">
+                    Your library is empty
+                </div>
+
+                <div style="
+                    font-size:11px;
+                    color:#8b96ae;
+                ">
+                    Save your favorite books here and
+                    build your personal reading collection.
+                </div>
+            </div>
+        </div>
+        """)
