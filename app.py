@@ -791,6 +791,69 @@ div[data-testid="stForm"] div[data-testid="stTextInput"] input {
     color: #34456f !important;
 }
 
+/* ---------------------------------------------------------
+   THEME HARDENING (works even if the browser is in dark mode)
+--------------------------------------------------------- */
+
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background: #f8faff !important;
+    color: #26365f !important;
+}
+
+.stApp p, .stApp label, .stApp span, .stApp li,
+[data-testid="stCaptionContainer"], [data-testid="stMarkdownContainer"] {
+    color: #26365f;
+}
+
+[data-testid="stCaptionContainer"] {
+    color: #7b89a7 !important;
+}
+
+/* Tabs */
+[data-testid="stTabs"] button[role="tab"] p {
+    color: #5b6b91 !important;
+    font-size: 14px !important;
+    font-weight: 600 !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p {
+    color: #4d7cff !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+    background-color: #4d7cff !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab-border"] {
+    background-color: #e1e7f5 !important;
+}
+
+/* Search box: force white, kill dark fill */
+div[data-testid="stTextInput"] div[data-baseweb="input"],
+div[data-testid="stTextInput"] div[data-baseweb="base-input"] {
+    background: #ffffff !important;
+    border-color: transparent !important;
+}
+div[data-testid="stTextInput"] input {
+    background: transparent !important;
+    color: #26365f !important;
+    -webkit-text-fill-color: #26365f !important;
+}
+
+/* Sidebar radio dot -> brand blue instead of default red */
+[data-testid="stRadio"] [role="radiogroup"] label > div:first-child > div {
+    border-color: #4d7cff !important;
+}
+[data-testid="stRadio"] [role="radiogroup"] label[data-checked="true"] > div:first-child > div {
+    background-color: #4d7cff !important;
+}
+
+/* Selectbox, expander, number input */
+div[data-baseweb="select"] > div,
+[data-testid="stNumberInput"] input,
+[data-testid="stExpander"] {
+    background: #ffffff !important;
+    color: #26365f !important;
+}
+[data-testid="stExpander"] summary p { color: #26365f !important; }
+
 </style>
 """)
 
@@ -1459,14 +1522,27 @@ elif page == "Mood Recommendations":
             or st.session_state.get("mood_results_for") != active_mood
         )
 
+        mood_error = None
         if needs_fetch:
             with st.spinner(f"Finding books for your mood: {active_mood}..."):
-                st.session_state["mood_results"] = search_books_by_mood(active_mood, max_results=12)
-                st.session_state["mood_results_for"] = active_mood
+                try:
+                    st.session_state["mood_results"] = search_books_by_mood(active_mood, max_results=12)
+                    st.session_state["mood_results_for"] = active_mood
+                except BookSearchError as e:
+                    st.session_state["mood_results"] = []
+                    st.session_state.pop("mood_results_for", None)
+                    mood_error = str(e)
 
         results = st.session_state.get("mood_results", [])
 
-        if results:
+        if mood_error:
+            st.error(
+                "Couldn't reach the book search services right now. "
+                "Check your internet connection and click Find Books again."
+            )
+            with st.expander("Technical details"):
+                st.code(mood_error)
+        elif results:
             mood_html = html.escape(active_mood)
             st.html(f"""
             <div style="
@@ -1479,7 +1555,7 @@ elif page == "Mood Recommendations":
             </div>
             """)
 
-            render_book_grid(results, action_label="Save to Library", on_action=add_book)
+            render_book_grid(results, action_label="Save to Library", on_action=add_book, key_prefix="mood")
         else:
             st.html("""
             <div class="content-box">

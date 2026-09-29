@@ -167,10 +167,52 @@ def search_gutenberg(query, max_results=12):
     return results
 
 
+def _gutenberg_candidate_urls(text_url):
+    """The original URL first, then direct/mirror URLs for the same book."""
+    urls = [text_url]
+    m = re.search(r"/(?:ebooks|files|cache/epub)/(\d+)", text_url)
+    if m:
+        book_id = m.group(1)
+        urls += [
+            f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt",
+            f"https://gutenberg.pglaf.org/cache/epub/{book_id}/pg{book_id}.txt",
+            f"https://aleph.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt",
+            f"https://www.gutenberg.org/ebooks/{book_id}.txt.utf-8",
+        ]
+    seen, unique = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return unique
+
+
 def fetch_gutenberg_text(text_url):
-    """Download a Gutenberg plain-text book and strip the license header/footer."""
-    response = requests.get(text_url, headers=HEADERS, timeout=30)
-    response.raise_for_status()
+    """Download a Gutenberg plain-text book and strip the license header/footer.
+
+    Tries several URLs/mirrors with retries, because gutenberg.org can be slow
+    or unreachable from some networks.
+    """
+    last_error = None
+    response = None
+    for url in _gutenberg_candidate_urls(text_url):
+        for _attempt in range(2):
+            try:
+                # (connect timeout, read timeout)
+                response = requests.get(url, headers=HEADERS, timeout=(8, 60))
+                response.raise_for_status()
+                break
+            except requests.RequestException as e:
+                last_error = e
+                response = None
+        if response is not None:
+            break
+
+    if response is None:
+        raise requests.RequestException(
+            f"Could not reach Project Gutenberg or its mirrors ({last_error})"
+        )
+
     response.encoding = "utf-8"
     text = response.text.replace("\r\n", "\n")
 
